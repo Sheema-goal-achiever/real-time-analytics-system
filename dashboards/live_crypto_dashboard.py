@@ -1,169 +1,140 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import subprocess
-import time
-import json
-import sys
-import os
 from sqlalchemy import text
+import os
+import json
+import time
+import subprocess
 
-# --- 1. PAGE CONFIG ---
-st.set_page_config(page_title="Crypto Live Terminal 2026", layout="wide", page_icon="📈")
+# --- 1. INITIAL SETUP & DATABASE REPAIR ---
+st.set_page_config(page_title="Crypto Live Terminal 2026", layout="wide")
+
+def get_conn():
+    # This uses the 'sql' connection defined in your Secrets
+    return st.connection("sql")
+
+def initialize_database():
+    conn = get_conn()
+    try:
+        with conn.session as s:
+            # Fix: Create tables if they don't exist in Aiven
+            s.execute(text("""
+                CREATE TABLE IF NOT EXISTS CLIENT_CONFIG (
+                    ID INT AUTO_INCREMENT PRIMARY KEY,
+                    COMPANY_NAME VARCHAR(255) NOT NULL UNIQUE,
+                    PASSWORD VARCHAR(255) NOT NULL,
+                    DATA_SOURCE_URL TEXT,
+                    CATEGORY_MAP JSON
+                );
+            """))
+            s.execute(text("""
+                CREATE TABLE IF NOT EXISTS REALTIME_PURCHASES (
+                    ID INT AUTO_INCREMENT PRIMARY KEY,
+                    EVENT_TIME TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRODUCT_ID VARCHAR(50),
+                    REVENUE DECIMAL(18, 2),
+                    REGION VARCHAR(100)
+                );
+            """))
+            s.commit()
+    except Exception as e:
+        st.error(f"Database Setup Error: {e}")
+
+initialize_database()
 
 # --- 2. SESSION STATE ---
-if 'auth' not in st.session_state:
-    st.session_state.update({'auth': False, 'company': "", 'map': {}, 'proc': None})
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+if 'user_company' not in st.session_state:
+    st.session_state.user_company = None
 
-# --- 3. DATABASE CONNECTION ---
-def get_conn():
+# --- 3. AUTHENTICATION LOGIC ---
+def login_user(name, pwd):
+    conn = get_conn()
+    query = text("SELECT * FROM CLIENT_CONFIG WHERE COMPANY_NAME = :n AND PASSWORD = :p")
+    result = conn.query(query, params={"n": name, "p": pwd}, ttl=0)
+    if not result.empty:
+        st.session_state.logged_in = True
+        st.session_state.user_company = name
+        return True
+    return False
+
+def register_user(name, pwd, url):
+    conn = get_conn()
     try:
-        return st.connection('my_database', type='sql')
+        with conn.session as s:
+            s.execute(text("""
+                INSERT INTO CLIENT_CONFIG (COMPANY_NAME, PASSWORD, DATA_SOURCE_URL, CATEGORY_MAP) 
+                VALUES (:n, :p, :u, :m)
+            """), {"n": name, "p": pwd, "u": url, "m": json.dumps({})})
+            s.commit()
+        return True
     except Exception as e:
-        st.error(f"Database Connection Failed: {e}")
-        st.stop()
+        st.error(f"Registration Failed: {e}")
+        return False
 
-def start_ingester():
-    """Starts the Binance worker as a background process."""
-    if st.session_state.proc is None:
-        try:
-            st.session_state.proc = subprocess.Popen(
-                [sys.executable, "test_ws.py"],
-                env=os.environ.copy()
-            )
-        except Exception as e:
-            st.error(f"Failed to start pipeline: {e}")
-
-# --- 4. AUTHENTICATION ---
-if not st.session_state.auth:
-    tab1, tab2 = st.tabs(["🔐 Login", "🚀 Register"])
+# --- 4. THE UI ---
+if not st.session_state.logged_in:
+    tab1, tab2 = st.tabs(["Login", "Register New Company"])
+    
     with tab1:
         with st.form("login_form"):
-            u_in = st.text_input("Company Name")
-            p_in = st.text_input("Password", type="password")
-            if st.form_submit_button("Enter Terminal", width="stretch"):
-                conn = get_conn()
-                res = conn.query("SELECT * FROM CLIENT_CONFIG WHERE COMPANY_NAME=:u AND PASSWORD=:p", 
-                                 params={"u":u_in, "p":p_in}, ttl=0)
-                if not res.empty:
-                    st.session_state.auth = True
-                    st.session_state.company = res.iloc[0]['COMPANY_NAME']
-                    raw_map = res.iloc[0]['CATEGORY_MAP']
-                    st.session_state.map = json.loads(raw_map) if isinstance(raw_map, str) else raw_map
-                    start_ingester()
+            u = st.text_input("Company Name")
+            p = st.text_input("Password", type="password")
+            if st.form_submit_button("Login"):
+                if login_user(u, p):
                     st.rerun()
                 else:
                     st.error("Invalid Credentials")
+
     with tab2:
-        with st.form("signup_form"):
-            n = st.text_input("New Company Name")
-            p = st.text_input("Set Password", type="password")
-            url = st.text_input("Binance URL", value="wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade")
-            if st.form_submit_button("Register", width="stretch"):
-                conn = get_conn()
-                with conn.session as s:
-                    s.execute(text("INSERT INTO CLIENT_CONFIG (COMPANY_NAME, PASSWORD, DATA_SOURCE_URL, CATEGORY_MAP) VALUES (:n, :p, :u, '{}')"), 
-                              {"n": n, "p": p, "u": url})
-                    s.commit()
-                st.success("Registered! Login now.")
+        with st.form("reg_form"):
+            new_u = st.text_input("New Company Name")
+            new_p = st.text_input("Set Password", type="password")
+            new_url = st.text_input("Binance WS Link", value="wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade")
+            if st.form_submit_button("Create Account"):
+                if register_user(new_u, new_p, new_url):
+                    st.success("Account Created! Use the Login tab.")
 
-# --- 5. THE MAIN DASHBOARD ---
 else:
-    # --- SIDEBAR: MANAGEMENT ---
-    with st.sidebar:
-        st.markdown(f"## 🏢 {st.session_state.company}")
-        
-        with st.expander("➕ Add Inventory"):
-            new_cat = st.text_input("Category Name")
-            new_prods = st.text_area("Symbols (SOLUSDT, XRPUSDT)")
-            if st.button("Add & Sync"):
-                if new_cat and new_prods:
-                    added = {p.strip().upper(): new_cat.strip() for p in new_prods.split(',')}
-                    st.session_state.map.update(added)
-                    with get_conn().session as s:
-                        s.execute(text("UPDATE CLIENT_CONFIG SET CATEGORY_MAP=:m WHERE COMPANY_NAME=:c"), 
-                                  {"m": json.dumps(st.session_state.map), "c": st.session_state.company})
-                        s.commit()
-                    if st.session_state.proc: st.session_state.proc.terminate()
-                    st.session_state.proc = None
-                    start_ingester()
-                    st.rerun()
+    # --- 5. THE DASHBOARD (LOGGED IN) ---
+    st.sidebar.title(f"Welcome, {st.session_state.user_company}")
+    if st.sidebar.button("Logout"):
+        st.session_state.logged_in = False
+        st.rerun()
 
-        with st.expander("🗑️ Delete Inventory"):
-            current_coins = list(st.session_state.map.keys())
-            to_del = st.multiselect("Select to remove:", current_coins)
-            if st.button("Delete Selected"):
-                for coin in to_del: del st.session_state.map[coin]
-                with get_conn().session as s:
-                    s.execute(text("UPDATE CLIENT_CONFIG SET CATEGORY_MAP=:m WHERE COMPANY_NAME=:c"), 
-                              {"m": json.dumps(st.session_state.map), "c": st.session_state.company})
-                    s.commit()
-                if st.session_state.proc: st.session_state.proc.terminate()
-                st.session_state.proc = None
-                start_ingester()
-                st.rerun()
-
-        with st.expander("🚨 Danger Zone"):
-            if st.button("Truncate Table (Wipe Data)", width="stretch"):
-                with get_conn().session as s:
-                    s.execute(text("TRUNCATE TABLE REALTIME_PURCHASES"))
-                    s.commit()
-                st.rerun()
-
-        if st.button("🔓 Logout", width="stretch"):
-            if st.session_state.proc: st.session_state.proc.terminate()
-            st.session_state.update({'auth': False, 'proc': None})
-            st.rerun()
-
-    # --- MAIN VIEW LAYOUT ---
-    st.title(f"📊 Live Market Terminal")
+    st.title("🚀 Real-Time Crypto Analytics")
     
-    metric_area = st.empty()
+    # Start the Binance Worker in the background if not running
+    if 'worker_started' not in st.session_state:
+        subprocess.Popen(["python", "test_ws.py"])
+        st.session_state.worker_started = True
+        st.info("Live data worker started...")
+
+    # Layout for charts
     col1, col2 = st.columns(2)
-    p1_placeholder = col1.empty()
-    
-    # --- DYNAMIC DROPDOWN LOGIC ---
-    with col2:
-        # Get categories directly from YOUR inventory map
-        if st.session_state.map:
-            available_cats = sorted(list(set(st.session_state.map.values())))
-        else:
-            available_cats = ["No Inventory Found"]
-            
-        # Selectbox stays outside the loop to prevent duplicate key errors
-        selected_cat = st.selectbox("View Assets for Category:", available_cats, key="stable_cat_selector")
-        p2_placeholder = st.empty()
 
-    table_placeholder = st.empty()
+    # Fetch Data from Aiven for Charts
+    conn = get_conn()
+    df = conn.query("SELECT * FROM REALTIME_PURCHASES ORDER BY EVENT_TIME DESC LIMIT 100", ttl=0)
 
-    # --- THE DATA UPDATE LOOP ---
-    while True:
-        try:
-            df = get_conn().query("SELECT * FROM REALTIME_PURCHASES ORDER BY EVENT_TIME DESC LIMIT 100", ttl=0)
-
-            if not df.empty:
-                with metric_area.container():
-                    m1, m2 = st.columns(2)
-                    m1.metric("Total Session Revenue", f"${df['REVENUE'].sum():,.2f}")
-                    m2.metric("Latest Symbol", df['PRODUCT_ID'].iloc[0])
-
-                # Chart 1: Global Revenue by Category
-                fig1 = px.pie(df, names='REGION', values='REVENUE', hole=0.4, 
-                              template="plotly_dark", title="Total Revenue by Category")
-                p1_placeholder.plotly_chart(fig1, use_container_width=True)
-
-                # Chart 2: Filtered by Dropdown Selection
-                filtered_df = df[df['REGION'] == selected_cat]
-                if not filtered_df.empty:
-                    fig2 = px.pie(filtered_df, names='PRODUCT_ID', values='REVENUE', 
-                                  hole=0.4, template="plotly_dark", title=f"Assets in {selected_cat}")
-                    p2_placeholder.plotly_chart(fig2, use_container_width=True)
-                else:
-                    p2_placeholder.info(f"Waiting for live {selected_cat} trades...")
-
-                table_placeholder.dataframe(df, use_container_width=True, hide_index=True)
-            
-        except Exception as e:
-            st.error(f"Display Error: {e}")
+    if not df.empty:
+        with col1:
+            st.subheader("Live Price/Revenue Stream")
+            fig = px.line(df, x="EVENT_TIME", y="REVENUE", color="PRODUCT_ID", title="Incoming Market Data")
+            st.plotly_chart(fig, use_container_width=True)
         
-        time.sleep(10)
+        with col2:
+            st.subheader("Market Share by Region")
+            fig2 = px.pie(df, values="REVENUE", names="REGION", title="Global Trade Distribution")
+            st.plotly_chart(fig2, use_container_width=True)
+            
+        st.subheader("Recent Activity Log")
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.warning("Waiting for data from Binance... (ensure test_ws.py is correctly configured with Aiven credentials)")
+
+    # Auto-refresh every 5 seconds
+    time.sleep(5)
+    st.rerun()
