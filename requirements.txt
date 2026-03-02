@@ -1,0 +1,9 @@
+mysql-connector-python
+sqlalchemy
+pandas
+python-dotenv
+websocket-client
+flask
+gunicorn
+requests
+openpyxl

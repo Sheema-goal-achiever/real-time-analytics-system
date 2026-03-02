@@ -1,0 +1,1 @@
+web: gunicorn ingester:app --bind 0.0.0.0:$PORT & python3 test_ws.py
