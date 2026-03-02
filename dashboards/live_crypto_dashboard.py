@@ -2,23 +2,18 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from sqlalchemy import text
-import os
-import json
-import time
-import subprocess
+import os, json, time, sys, subprocess
 
-# --- 1. INITIAL SETUP & DATABASE REPAIR ---
 st.set_page_config(page_title="Crypto Live Terminal 2026", layout="wide")
 
+# --- 1. CONNECTION & DATABASE REPAIR ---
 def get_conn():
-    # Matches the name in your Streamlit Secrets: [connections.my_database]
     return st.connection("my_database", type="sql")
 
 def initialize_database():
     conn = get_conn()
     try:
         with conn.session as s:
-            # FIX: Use text() only for EXECUTE (Writes)
             s.execute(text("""
                 CREATE TABLE IF NOT EXISTS CLIENT_CONFIG (
                     ID INT AUTO_INCREMENT PRIMARY KEY,
@@ -26,8 +21,7 @@ def initialize_database():
                     PASSWORD VARCHAR(255) NOT NULL,
                     DATA_SOURCE_URL TEXT,
                     CATEGORY_MAP JSON
-                );
-            """))
+            );"""))
             s.execute(text("""
                 CREATE TABLE IF NOT EXISTS REALTIME_PURCHASES (
                     ID INT AUTO_INCREMENT PRIMARY KEY,
@@ -35,107 +29,86 @@ def initialize_database():
                     PRODUCT_ID VARCHAR(50),
                     REVENUE DECIMAL(18, 2),
                     REGION VARCHAR(100)
-                );
-            """))
+            );"""))
             s.commit()
     except Exception as e:
         st.error(f"Database Setup Error: {e}")
 
 initialize_database()
 
-# --- 2. SESSION STATE ---
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-if 'user_company' not in st.session_state:
-    st.session_state.user_company = None
+# --- 2. AUTHENTICATION ---
+if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 
-# --- 3. AUTHENTICATION LOGIC ---
 def login_user(name, pwd):
     conn = get_conn()
-    # FIX: Use a PLAIN STRING for conn.query to avoid UnhashableParamError
-    query = "SELECT * FROM CLIENT_CONFIG WHERE COMPANY_NAME = :n AND PASSWORD = :p"
-    result = conn.query(query, params={"n": name, "p": pwd}, ttl=0)
-    
-    if not result.empty:
+    # Plain string for conn.query to avoid Unhashable error
+    df = conn.query("SELECT * FROM CLIENT_CONFIG WHERE COMPANY_NAME = :n AND PASSWORD = :p", 
+                    params={"n": name, "p": pwd}, ttl=0)
+    if not df.empty:
         st.session_state.logged_in = True
         st.session_state.user_company = name
         return True
     return False
 
-def register_user(name, pwd, url):
-    conn = get_conn()
-    try:
-        with conn.session as s:
-            # Use text() here because it is an INSERT (execute)
-            s.execute(text("""
-                INSERT INTO CLIENT_CONFIG (COMPANY_NAME, PASSWORD, DATA_SOURCE_URL, CATEGORY_MAP) 
-                VALUES (:n, :p, :u, :m)
-            """), {"n": name, "p": pwd, "u": url, "m": json.dumps({})})
-            s.commit()
-        return True
-    except Exception as e:
-        st.error(f"Registration Failed: {e}")
-        return False
-
-# --- 4. THE UI ---
+# --- 3. UI LOGIC ---
 if not st.session_state.logged_in:
-    tab1, tab2 = st.tabs(["🔒 Login", "📝 Register Company"])
-    
-    with tab1:
-        with st.form("login_form"):
-            u = st.text_input("Company Name")
-            p = st.text_input("Password", type="password")
-            if st.form_submit_button("Login"):
-                if login_user(u, p):
-                    st.rerun()
-                else:
-                    st.error("Invalid Credentials")
-
-    with tab2:
-        with st.form("reg_form"):
-            new_u = st.text_input("New Company Name")
-            new_p = st.text_input("Set Password", type="password")
-            new_url = st.text_input("Binance WS Link", value="wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade")
-            if st.form_submit_button("Create Account"):
-                if register_user(new_u, new_p, new_url):
-                    st.success("Account Created! Use the Login tab.")
-
+    # ... (Keep your Login/Register forms here)
+    st.title("🔐 Login to Crypto Terminal")
+    u = st.text_input("Company")
+    p = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if login_user(u, p): st.rerun()
 else:
-    # --- 5. THE DASHBOARD ---
+    # --- 4. THE FULL DASHBOARD ---
     st.sidebar.title(f"🏢 {st.session_state.user_company}")
+    
+    # --- WORKER AUTO-START FIX ---
+    if 'worker_started' not in st.session_state:
+        # Use sys.executable to find the correct Python path on Streamlit Cloud
+        subprocess.Popen([sys.executable, "test_ws.py"])
+        st.session_state.worker_started = True
+        st.sidebar.success("✅ Live Data Worker Active")
+
+    # --- INVENTORY MANAGEMENT SECTION ---
+    with st.expander("🛠️ Inventory & Table Management"):
+        col_a, col_b = st.columns(2)
+        
+        with col_a:
+            st.write("### Add New Product")
+            new_prod = st.text_input("Product ID (e.g. btcusdt)")
+            new_rev = st.number_input("Initial Revenue", value=0.0)
+            if st.button("Add to Inventory"):
+                conn = get_conn()
+                with conn.session as s:
+                    s.execute(text("INSERT INTO REALTIME_PURCHASES (PRODUCT_ID, REVENUE, REGION) VALUES (:id, :rv, 'Manual')"),
+                              {"id": new_prod, "rv": new_rev})
+                    s.commit()
+                st.success(f"Added {new_prod}")
+
+        with col_b:
+            st.write("### Danger Zone")
+            if st.button("🗑️ Delete All Purchase Data"):
+                conn = get_conn()
+                with conn.session as s:
+                    s.execute(text("DELETE FROM REALTIME_PURCHASES"))
+                    s.commit()
+                st.warning("All market data deleted!")
+                st.rerun()
+
+    # --- 5. ANALYTICS ---
+    conn = get_conn()
+    df = conn.query("SELECT * FROM REALTIME_PURCHASES ORDER BY EVENT_TIME DESC LIMIT 100", ttl=0)
+
+    if not df.empty:
+        fig = px.line(df, x="EVENT_TIME", y="REVENUE", color="PRODUCT_ID", title="Live Market Feed")
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("Waiting for data... Add a product above or wait for Binance.")
+
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
         st.rerun()
 
-    st.title("🚀 Real-Time Crypto Analytics")
-    
-    # Background Worker for Binance
-    if 'worker_started' not in st.session_state:
-        # Assumes test_ws.py is in the same directory
-        subprocess.Popen(["python", "test_ws.py"])
-        st.session_state.worker_started = True
-
-    col1, col2 = st.columns(2)
-    conn = get_conn()
-    
-    # Fetch data using plain string query
-    df = conn.query("SELECT * FROM REALTIME_PURCHASES ORDER BY EVENT_TIME DESC LIMIT 100", ttl=0)
-
-    if not df.empty:
-        with col1:
-            st.subheader("Live Market Volatility")
-            fig = px.line(df, x="EVENT_TIME", y="REVENUE", color="PRODUCT_ID", template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            st.subheader("Trade Volume by Region")
-            fig2 = px.bar(df, x="REGION", y="REVENUE", color="PRODUCT_ID", barmode="group")
-            st.plotly_chart(fig2, use_container_width=True)
-            
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.info("🔄 Connecting to Binance... Please wait for the first trade data.")
-
-    # Auto-refresh logic
-    time.sleep(2)
+    time.sleep(3)
     st.rerun()
