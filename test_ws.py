@@ -1,120 +1,119 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import subprocess
-import time
+import websocket
 import json
-import sys
-from sqlalchemy import text
+import mysql.connector
+import os
+import time
+from datetime import datetime
+from dotenv import load_dotenv
 
-# --- 1. PAGE CONFIG ---
-st.set_page_config(page_title="Crypto Live Terminal", layout="wide", page_icon="📈")
+# --- 1. LOAD CONFIGURATION ---
+# This loads variables from your .env file locally.
+# On Streamlit Cloud, it will automatically pull from the "Secrets" you defined.
+load_dotenv()
 
-# --- 2. SESSION STATE ---
-if 'auth' not in st.session_state:
-    st.session_state.update({'auth': False, 'company': "", 'map': {}, 'proc': None})
+AIVEN_HOST = os.getenv("AIVEN_HOST")
+AIVEN_PORT = os.getenv("AIVEN_PORT")
+AIVEN_USER = os.getenv("AIVEN_USER")
+AIVEN_PASSWORD = os.getenv("AIVEN_PASSWORD")
+AIVEN_DATABASE = os.getenv("AIVEN_DATABASE")
 
-# --- 3. DATABASE CONNECTION ---
-def get_conn():
+# --- 2. DATABASE LOGIC ---
+def get_db_connection():
+    """Connects to the Aiven MySQL Cloud Database."""
     try:
-        return st.connection('my_database', type='sql')
-    except:
-        url = "mysql+mysqlconnector://root:Sheema%40123@localhost:3306/real_time_analytics"
-        return st.connection("backup_db", type="sql", url=url)
+        return mysql.connector.connect(
+            host=AIVEN_HOST,
+            port=int(AIVEN_PORT) if AIVEN_PORT else 3306,
+            user=AIVEN_USER,
+            password=AIVEN_PASSWORD,
+            database=AIVEN_DATABASE,
+            autocommit=True
+        )
+    except Exception as e:
+        print(f"❌ Database Connection Error: {e}")
+        return None
 
-def start_ingester():
-    if st.session_state.proc is None:
-        try:
-            st.session_state.proc = subprocess.Popen([sys.executable, "test_ws.py"])
-        except Exception as e:
-            st.error(f"Failed to start pipeline: {e}")
-
-# --- 4. AUTHENTICATION ---
-if not st.session_state.auth:
-    tab1, tab2 = st.tabs(["🔐 Login", "🚀 Register"])
-    with tab1:
-        with st.form("login_form"):
-            u_in = st.text_input("Company Name")
-            p_in = st.text_input("Password", type="password")
-            if st.form_submit_button("Enter Terminal"):
-                conn = get_conn()
-                res = conn.query("SELECT COMPANY_NAME, CATEGORY_MAP FROM CLIENT_CONFIG WHERE COMPANY_NAME=:u AND PASSWORD=:p", params={"u":u_in, "p":p_in}, ttl=0)
-                if not res.empty:
-                    st.session_state.auth = True
-                    st.session_state.company = res.iloc[0]['COMPANY_NAME']
-                    raw_map = res.iloc[0]['CATEGORY_MAP']
-                    st.session_state.map = json.loads(raw_map) if isinstance(raw_map, str) else raw_map
-                    start_ingester()
-                    st.rerun()
-                else:
-                    st.error("Invalid Credentials")
-    with tab2:
-        with st.form("signup_form"):
-            n = st.text_input("New Company Name")
-            p = st.text_input("Set Password", type="password")
-            url = st.text_input("Binance URL", value="wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/xrpusdt@trade/adausdt@trade/dogeusdt@trade")
-            cat, prods = st.text_input("Category", "Majors"), st.text_area("Products", "BTCUSDT, ETHUSDT")
-            if st.form_submit_button("Register"):
-                mapping = {prod.strip().upper(): cat.strip() for prod in prods.split(',')}
-                conn = get_conn()
-                with conn.session as s:
-                    s.execute(text("INSERT INTO CLIENT_CONFIG (COMPANY_NAME, PASSWORD, DATA_SOURCE_URL, CATEGORY_MAP) VALUES (:n, :p, :u, :m)"), 
-                              {"n": n, "p": p, "u": url, "m": json.dumps(mapping)})
-                    s.commit()
-                st.success("Registered! Go to Login.")
-
-# --- 5. THE DASHBOARD ---
-else:
-    st.sidebar.markdown(f"## 🏢 {st.session_state.company}")
+def fetch_client_config():
+    """Retrieves the Binance URL and Category Mapping from the DB."""
+    conn = get_db_connection()
+    if not conn:
+        return None, None
     
-    with st.sidebar.expander("➕ Add Inventory"):
-        nc = st.text_input("Category Name")
-        np = st.text_area("Product List")
-        if st.button("Update Inventory"):
-            new_m = {**st.session_state.map, **{p.strip().upper(): nc.strip() for p in np.split(',')}}
-            conn = get_conn()
-            with conn.session as s:
-                s.execute(text("UPDATE CLIENT_CONFIG SET CATEGORY_MAP=:m WHERE COMPANY_NAME=:c"), {"m": json.dumps(new_m), "c": st.session_state.company})
-                s.commit()
-            if st.session_state.proc: st.session_state.proc.terminate()
-            st.session_state.proc = None
-            time.sleep(1)
-            start_ingester()
-            st.rerun()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        # We fetch the most recent config. Adjust the query if you want a specific company.
+        cursor.execute("SELECT DATA_SOURCE_URL, CATEGORY_MAP FROM CLIENT_CONFIG ORDER BY COMPANY_NAME DESC LIMIT 1")
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if row:
+            # Handle JSON mapping (converts string to dict if necessary)
+            mapping = row['CATEGORY_MAP']
+            if isinstance(mapping, str):
+                mapping = json.loads(mapping)
+            return row['DATA_SOURCE_URL'], mapping
+    except Exception as e:
+        print(f"❌ Error fetching config: {e}")
+    return None, None
 
-    if st.sidebar.button("🔓 Logout", width="stretch"):
-        if st.session_state.proc: st.session_state.proc.terminate()
-        st.session_state.update({'auth': False, 'proc': None})
-        st.rerun()
+# --- 3. WEBSOCKET LOGIC ---
+def on_message(ws, message):
+    data = json.loads(message)
+    if 'data' in data:
+        trade = data['data']
+        symbol = trade['s'] # e.g., BTCUSDT
+        price = float(trade['p'])
+        quantity = float(trade['q'])
+        event_time = datetime.fromtimestamp(trade['E'] / 1000.0)
+        
+        # Determine the Category (Region) from our mapping
+        region = CATEGORY_MAP.get(symbol, "Other")
+        revenue = price * quantity
 
-    st.title(f"📊 {st.session_state.company} Live Terminal")
+        # Insert into Aiven
+        conn = get_db_connection()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                query = """
+                    INSERT INTO REALTIME_PURCHASES 
+                    (PRODUCT_ID, PRICE, QUANTITY, REVENUE, EVENT_TIME, REGION)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(query, (symbol, price, quantity, revenue, event_time, region))
+                conn.commit()
+                cursor.close()
+                conn.close()
+                print(f"✅ Stored: {symbol} | ${price:.2f} | Region: {region}")
+            except Exception as e:
+                print(f"❌ Insert Fail: {e}")
+
+def on_error(ws, error):
+    print(f"🔌 Connection Error: {error}")
+
+def on_close(ws, close_status_code, close_msg):
+    print("🔌 WebSocket Closed. Retrying in 5 seconds...")
+    time.sleep(5)
+    start_websocket()
+
+# --- 4. EXECUTION ---
+def start_websocket():
+    global CATEGORY_MAP
+    binance_url, CATEGORY_MAP = fetch_client_config()
     
-    metric_area = st.empty()
-    col1, col2 = st.columns(2)
-    pie1_placeholder = col1.empty()
-    pie2_placeholder = col2.empty()
-    table_placeholder = st.empty()
+    if not binance_url:
+        print("⚠️ No configuration found in CLIENT_CONFIG table. Please register via Dashboard.")
+        return
 
-    while True:
-        conn = get_conn()
-        df = conn.query("SELECT * FROM REALTIME_PURCHASES ORDER BY EVENT_TIME DESC LIMIT 100", ttl=0)
+    print(f"🚀 Connecting to Binance: {binance_url}")
+    ws = websocket.WebSocketApp(
+        binance_url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.run_forever()
 
-        if not df.empty:
-            with metric_area.container():
-                m1, m2 = st.columns(2)
-                m1.metric("Total Session Revenue", f"${df['REVENUE'].sum():,.2f}")
-                m2.metric("Latest Symbol", df['PRODUCT_ID'].iloc[0])
-
-            fig1 = px.pie(df, names='REGION', values='REVENUE', hole=0.4, template="plotly_dark", title="Revenue by Category")
-            # UPDATED: width="stretch"
-            pie1_placeholder.plotly_chart(fig1, width="stretch", key="cat_pie")
-
-            cats = df['REGION'].unique()
-            fig2 = px.pie(df[df['REGION'] == cats[0]], names='PRODUCT_ID', values='REVENUE', hole=0.4, template="plotly_dark", title=f"Assets in {cats[0]}")
-            # UPDATED: width="stretch"
-            pie2_placeholder.plotly_chart(fig2, width="stretch", key="prod_pie")
-
-            # UPDATED: width="stretch"
-            table_placeholder.dataframe(df, width="stretch", hide_index=True)
-
-        time.sleep(10)
+if __name__ == "__main__":
+    start_websocket()
