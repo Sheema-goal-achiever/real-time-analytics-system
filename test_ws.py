@@ -4,116 +4,94 @@ import mysql.connector
 import os
 import time
 from datetime import datetime
+from mysql.connector import Error
 from dotenv import load_dotenv
 
-# --- 1. LOAD CONFIGURATION ---
-# This loads variables from your .env file locally.
-# On Streamlit Cloud, it will automatically pull from the "Secrets" you defined.
 load_dotenv()
 
-AIVEN_HOST = os.getenv("AIVEN_HOST")
-AIVEN_PORT = os.getenv("AIVEN_PORT")
-AIVEN_USER = os.getenv("AIVEN_USER")
-AIVEN_PASSWORD = os.getenv("AIVEN_PASSWORD")
-AIVEN_DATABASE = os.getenv("AIVEN_DATABASE")
+# Configuration from Environment / Secrets
+DB_SETTINGS = {
+    "host": os.getenv("AIVEN_HOST"),
+    "port": int(os.getenv("AIVEN_PORT", 3306)),
+    "user": os.getenv("AIVEN_USER"),
+    "password": os.getenv("AIVEN_PASSWORD"),
+    "database": os.getenv("AIVEN_DATABASE"),
+    "pool_name": "mypool",
+    "pool_size": 5  # Connection pooling handles high-frequency trades better
+}
 
-# --- 2. DATABASE LOGIC ---
 def get_db_connection():
-    """Connects to the Aiven MySQL Cloud Database."""
+    """Returns a connection from the pool."""
     try:
-        return mysql.connector.connect(
-            host=AIVEN_HOST,
-            port=int(AIVEN_PORT) if AIVEN_PORT else 3306,
-            user=AIVEN_USER,
-            password=AIVEN_PASSWORD,
-            database=AIVEN_DATABASE,
-            autocommit=True
-        )
-    except Exception as e:
-        print(f"❌ Database Connection Error: {e}")
+        return mysql.connector.connect(**DB_SETTINGS, autocommit=True)
+    except Error as e:
+        print(f"❌ Could not connect to Aiven: {e}")
         return None
 
-def fetch_client_config():
-    """Retrieves the Binance URL and Category Mapping from the DB."""
+def fetch_config():
+    """Fetches Binance URL and Category Mapping."""
     conn = get_db_connection()
-    if not conn:
-        return None, None
-    
+    if not conn: return None, None
     try:
         cursor = conn.cursor(dictionary=True)
-        # We fetch the most recent config. Adjust the query if you want a specific company.
-        cursor.execute("SELECT DATA_SOURCE_URL, CATEGORY_MAP FROM CLIENT_CONFIG ORDER BY COMPANY_NAME DESC LIMIT 1")
+        cursor.execute("SELECT DATA_SOURCE_URL, CATEGORY_MAP FROM CLIENT_CONFIG LIMIT 1")
         row = cursor.fetchone()
         cursor.close()
         conn.close()
-        
         if row:
-            # Handle JSON mapping (converts string to dict if necessary)
             mapping = row['CATEGORY_MAP']
-            if isinstance(mapping, str):
-                mapping = json.loads(mapping)
-            return row['DATA_SOURCE_URL'], mapping
+            return row['DATA_SOURCE_URL'], (json.loads(mapping) if isinstance(mapping, str) else mapping)
     except Exception as e:
-        print(f"❌ Error fetching config: {e}")
+        print(f"❌ Config Fetch Error: {e}")
     return None, None
 
-# --- 3. WEBSOCKET LOGIC ---
 def on_message(ws, message):
     data = json.loads(message)
     if 'data' in data:
         trade = data['data']
-        symbol = trade['s'] # e.g., BTCUSDT
-        price = float(trade['p'])
-        quantity = float(trade['q'])
-        event_time = datetime.fromtimestamp(trade['E'] / 1000.0)
-        
-        # Determine the Category (Region) from our mapping
+        symbol, price, qty = trade['s'], float(trade['p']), float(trade['q'])
         region = CATEGORY_MAP.get(symbol, "Other")
-        revenue = price * quantity
-
-        # Insert into Aiven
+        
         conn = get_db_connection()
         if conn:
             try:
                 cursor = conn.cursor()
-                query = """
-                    INSERT INTO REALTIME_PURCHASES 
-                    (PRODUCT_ID, PRICE, QUANTITY, REVENUE, EVENT_TIME, REGION)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """
-                cursor.execute(query, (symbol, price, quantity, revenue, event_time, region))
-                conn.commit()
+                query = "INSERT INTO REALTIME_PURCHASES (PRODUCT_ID, PRICE, QUANTITY, REVENUE, EVENT_TIME, REGION) VALUES (%s, %s, %s, %s, %s, %s)"
+                cursor.execute(query, (symbol, price, qty, price * qty, datetime.now(), region))
                 cursor.close()
                 conn.close()
-                print(f"✅ Stored: {symbol} | ${price:.2f} | Region: {region}")
-            except Exception as e:
-                print(f"❌ Insert Fail: {e}")
+                print(f"✅ Stored {symbol} | ${price}")
+            except Error as e:
+                print(f"❌ Insert Error: {e}")
 
 def on_error(ws, error):
-    print(f"🔌 Connection Error: {error}")
+    print(f"🔌 Socket Error: {error}")
 
 def on_close(ws, close_status_code, close_msg):
-    print("🔌 WebSocket Closed. Retrying in 5 seconds...")
-    time.sleep(5)
-    start_websocket()
+    print("🔌 Connection Closed. Restarting in 5s...")
 
-# --- 4. EXECUTION ---
-def start_websocket():
+def start():
     global CATEGORY_MAP
-    binance_url, CATEGORY_MAP = fetch_client_config()
+    url, CATEGORY_MAP = fetch_config()
     
-    if not binance_url:
-        print("⚠️ No configuration found in CLIENT_CONFIG table. Please register via Dashboard.")
+    if not url:
+        print("⚠️ No URL found. Checking again in 10s...")
+        time.sleep(10)
         return
 
-    print(f"🚀 Connecting to Binance: {binance_url}")
-    ws = websocket.WebSocketApp(
-        binance_url,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-    ws.run_forever()
+    # The Infinite Reconnect Loop
+    while True:
+        print(f"🚀 Connecting to Binance: {url}")
+        ws = websocket.WebSocketApp(
+            url,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
+        )
+        ws.run_forever()
+        
+        # If run_forever returns, it means the connection dropped
+        time.sleep(5) 
 
 if __name__ == "__main__":
-    start_websocket()
+    start()
