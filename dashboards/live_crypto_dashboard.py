@@ -11,14 +11,14 @@ import subprocess
 st.set_page_config(page_title="Crypto Live Terminal 2026", layout="wide")
 
 def get_conn():
-    # This uses the 'sql' connection defined in your Secrets
-    return st.connection("sql")
+    # Matches the name in your Streamlit Secrets: [connections.my_database]
+    return st.connection("my_database", type="sql")
 
 def initialize_database():
     conn = get_conn()
     try:
         with conn.session as s:
-            # Fix: Create tables if they don't exist in Aiven
+            # FIX: Use text() only for EXECUTE (Writes)
             s.execute(text("""
                 CREATE TABLE IF NOT EXISTS CLIENT_CONFIG (
                     ID INT AUTO_INCREMENT PRIMARY KEY,
@@ -52,8 +52,10 @@ if 'user_company' not in st.session_state:
 # --- 3. AUTHENTICATION LOGIC ---
 def login_user(name, pwd):
     conn = get_conn()
-    query = text("SELECT * FROM CLIENT_CONFIG WHERE COMPANY_NAME = :n AND PASSWORD = :p")
+    # FIX: Use a PLAIN STRING for conn.query to avoid UnhashableParamError
+    query = "SELECT * FROM CLIENT_CONFIG WHERE COMPANY_NAME = :n AND PASSWORD = :p"
     result = conn.query(query, params={"n": name, "p": pwd}, ttl=0)
+    
     if not result.empty:
         st.session_state.logged_in = True
         st.session_state.user_company = name
@@ -64,6 +66,7 @@ def register_user(name, pwd, url):
     conn = get_conn()
     try:
         with conn.session as s:
+            # Use text() here because it is an INSERT (execute)
             s.execute(text("""
                 INSERT INTO CLIENT_CONFIG (COMPANY_NAME, PASSWORD, DATA_SOURCE_URL, CATEGORY_MAP) 
                 VALUES (:n, :p, :u, :m)
@@ -76,7 +79,7 @@ def register_user(name, pwd, url):
 
 # --- 4. THE UI ---
 if not st.session_state.logged_in:
-    tab1, tab2 = st.tabs(["Login", "Register New Company"])
+    tab1, tab2 = st.tabs(["🔒 Login", "📝 Register Company"])
     
     with tab1:
         with st.form("login_form"):
@@ -98,43 +101,41 @@ if not st.session_state.logged_in:
                     st.success("Account Created! Use the Login tab.")
 
 else:
-    # --- 5. THE DASHBOARD (LOGGED IN) ---
-    st.sidebar.title(f"Welcome, {st.session_state.user_company}")
+    # --- 5. THE DASHBOARD ---
+    st.sidebar.title(f"🏢 {st.session_state.user_company}")
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
         st.rerun()
 
     st.title("🚀 Real-Time Crypto Analytics")
     
-    # Start the Binance Worker in the background if not running
+    # Background Worker for Binance
     if 'worker_started' not in st.session_state:
+        # Assumes test_ws.py is in the same directory
         subprocess.Popen(["python", "test_ws.py"])
         st.session_state.worker_started = True
-        st.info("Live data worker started...")
 
-    # Layout for charts
     col1, col2 = st.columns(2)
-
-    # Fetch Data from Aiven for Charts
     conn = get_conn()
+    
+    # Fetch data using plain string query
     df = conn.query("SELECT * FROM REALTIME_PURCHASES ORDER BY EVENT_TIME DESC LIMIT 100", ttl=0)
 
     if not df.empty:
         with col1:
-            st.subheader("Live Price/Revenue Stream")
-            fig = px.line(df, x="EVENT_TIME", y="REVENUE", color="PRODUCT_ID", title="Incoming Market Data")
+            st.subheader("Live Market Volatility")
+            fig = px.line(df, x="EVENT_TIME", y="REVENUE", color="PRODUCT_ID", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            st.subheader("Market Share by Region")
-            fig2 = px.pie(df, values="REVENUE", names="REGION", title="Global Trade Distribution")
+            st.subheader("Trade Volume by Region")
+            fig2 = px.bar(df, x="REGION", y="REVENUE", color="PRODUCT_ID", barmode="group")
             st.plotly_chart(fig2, use_container_width=True)
             
-        st.subheader("Recent Activity Log")
         st.dataframe(df, use_container_width=True)
     else:
-        st.warning("Waiting for data from Binance... (ensure test_ws.py is correctly configured with Aiven credentials)")
+        st.info("🔄 Connecting to Binance... Please wait for the first trade data.")
 
-    # Auto-refresh every 5 seconds
-    time.sleep(5)
+    # Auto-refresh logic
+    time.sleep(2)
     st.rerun()
