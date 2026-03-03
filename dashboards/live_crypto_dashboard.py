@@ -51,16 +51,27 @@ def run_custom_stream(ws_url, inventory_map):
             
             # CASE CORRECTION: Force symbols to lowercase for mapping match
             raw_symbol = data.get('s', '').lower()
-            price = float(data.get('p', 0))
+            
+            # --- DATA EXTRACTION FIX ---
+            price = float(data.get('p', 0))      # 'p' is Price in Binance trades
+            quantity = float(data.get('q', 0))   # 'q' is Quantity in Binance trades
+            revenue = price * quantity           # Standard calculation
             
             # Lookup category (e.g., 'Majors' or 'Alts') from the map
             category = inventory_map.get(raw_symbol, "Uncategorized")
             
             with engine.begin() as conn:
+                # Targeted INSERT including Price and Quantity columns
                 conn.execute(text("""
-                    INSERT INTO REALTIME_PURCHASES (PRODUCT_ID, REVENUE, REGION) 
-                    VALUES (:s, :p, :r)
-                """), {"s": raw_symbol, "p": price, "r": category})
+                    INSERT INTO REALTIME_PURCHASES (PRODUCT_ID, PRICE, QUANTITY, REVENUE, REGION) 
+                    VALUES (:s, :pr, :q, :rev, :r)
+                """), {
+                    "s": raw_symbol, 
+                    "pr": price, 
+                    "q": quantity, 
+                    "rev": revenue, 
+                    "r": category
+                })
 
         ws = WebSocketApp(socket_url, on_message=on_message)
         ws.run_forever()
@@ -162,7 +173,6 @@ else:
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Market Segment Volume")
-            # Pulls from 'REGION' column which stores your custom Categories
             st.plotly_chart(px.pie(df, names='REGION', values='REVENUE', hole=0.5, template="plotly_dark"), width='stretch')
         with c2:
             st.subheader("Asset Drill-Down")
