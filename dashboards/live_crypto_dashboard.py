@@ -8,15 +8,15 @@ from websocket import WebSocketApp
 from collections import deque
 
 # -----------------------------
-# 1. CONFIG
+# 1. PAGE CONFIG
 # -----------------------------
-st.set_page_config(page_title="Universal WebSocket Analytics", layout="wide")
+st.set_page_config(page_title="WebSocket Analytics Engine", layout="wide")
 
 # -----------------------------
 # 2. SESSION STATE INIT
 # -----------------------------
-if "ws_running" not in st.session_state:
-    st.session_state.ws_running = False
+if "connected" not in st.session_state:
+    st.session_state.connected = False
 
 if "data_stream" not in st.session_state:
     st.session_state.data_stream = deque(maxlen=500)
@@ -25,27 +25,21 @@ if "ws_url" not in st.session_state:
     st.session_state.ws_url = ""
 
 # -----------------------------
-# 3. SAFE PARSER (works with ANY websocket)
+# 3. SAFE PARSER (works with any JSON)
 # -----------------------------
-def safe_parse(msg):
-    """
-    Tries to extract useful fields from ANY JSON message.
-    If unknown format → still stores raw message.
-    """
-
+def safe_parse(message):
     try:
-        data = json.loads(msg)
+        data = json.loads(message)
     except:
         return {
-            "raw": str(msg),
-            "symbol": "unknown",
+            "symbol": "raw",
             "value": 0,
             "quantity": 0,
             "category": "unparsed",
+            "raw": str(message),
             "time": time.time()
         }
 
-    # Binance-style
     if isinstance(data, dict):
         inner = data.get("data", data)
 
@@ -64,19 +58,16 @@ def safe_parse(msg):
         except:
             qty = 0
 
-        value = price * qty
-
         return {
             "symbol": symbol,
-            "value": value,
+            "value": price * qty,
             "price": price,
             "quantity": qty,
-            "category": symbol.split("usdt")[0] if "usdt" in symbol else "generic",
+            "category": symbol.replace("usdt", "") if "usdt" in symbol else "generic",
             "time": time.time()
         }
 
     return {
-        "raw": str(data),
         "symbol": "unknown",
         "value": 0,
         "quantity": 0,
@@ -94,16 +85,22 @@ def run_ws(url):
         st.session_state.data_stream.append(parsed)
 
     def on_error(ws, error):
-        st.error(f"WebSocket error: {error}")
+        st.session_state.connected = False
+        print("WS ERROR:", error)
 
-    def on_close(ws, close_status_code, close_msg):
-        st.warning("WebSocket closed")
+    def on_close(ws, a, b):
+        st.session_state.connected = False
+        print("WS CLOSED")
+
+    def on_open(ws):
+        print("WS CONNECTED")
 
     ws = WebSocketApp(
         url,
         on_message=on_message,
         on_error=on_error,
-        on_close=on_close
+        on_close=on_close,
+        on_open=on_open
     )
 
     ws.run_forever()
@@ -112,19 +109,19 @@ def run_ws(url):
 # 5. START CONNECTION
 # -----------------------------
 def start_connection():
-    if st.session_state.ws_running:
-        return
-
     url = st.session_state.ws_url.strip()
 
     if not url:
         st.warning("Enter WebSocket URL")
         return
 
+    if st.session_state.connected:
+        return
+
     t = threading.Thread(target=run_ws, args=(url,), daemon=True)
     t.start()
 
-    st.session_state.ws_running = True
+    st.session_state.connected = True
 
 # -----------------------------
 # 6. UI
@@ -136,15 +133,19 @@ col1, col2 = st.columns([3, 1])
 with col1:
     st.session_state.ws_url = st.text_input(
         "WebSocket URL",
-        value=st.session_state.ws_url or "wss://stream.binance.com:9443/stream?streams=btcusdt@trade"
+        value=st.session_state.ws_url or
+        "wss://stream.binance.com:9443/stream?streams=btcusdt@trade"
     )
 
 with col2:
-    if st.button("🚀 Connect"):
-        start_connection()
+    if not st.session_state.connected:
+        if st.button("🚀 Connect"):
+            start_connection()
+    else:
+        st.success("🟢 Connected")
 
 # -----------------------------
-# 7. DATA PROCESSING
+# 7. DATAFRAME
 # -----------------------------
 df = pd.DataFrame(list(st.session_state.data_stream))
 
@@ -153,7 +154,7 @@ df = pd.DataFrame(list(st.session_state.data_stream))
 # -----------------------------
 if not df.empty:
 
-    st.subheader("📊 Live Data Stream")
+    st.subheader("📊 Live Stream Analytics")
 
     c1, c2 = st.columns(2)
 
@@ -163,19 +164,19 @@ if not df.empty:
             st.plotly_chart(fig, use_container_width=True)
 
     with c2:
-        if "symbol" in df.columns:
-            top = df.groupby("symbol")["value"].sum().reset_index()
-            fig2 = px.bar(top, x="symbol", y="value")
-            st.plotly_chart(fig2, use_container_width=True)
+        top = df.groupby("symbol")["value"].sum().reset_index()
+        fig2 = px.bar(top, x="symbol", y="value")
+        st.plotly_chart(fig2, use_container_width=True)
 
-    st.subheader("📦 Raw Stream Data")
+    st.subheader("📦 Live Data Feed")
     st.dataframe(df.tail(50), use_container_width=True)
 
 else:
-    st.info("Waiting for WebSocket data... connect to start streaming.")
+    st.info("Waiting for WebSocket data...")
 
 # -----------------------------
-# 9. AUTO REFRESH
+# 9. AUTO REFRESH (CRITICAL)
 # -----------------------------
-time.sleep(2)
-st.rerun()
+if st.session_state.connected:
+    time.sleep(2)
+    st.rerun()
