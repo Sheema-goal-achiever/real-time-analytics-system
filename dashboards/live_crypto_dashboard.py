@@ -8,15 +8,15 @@ from websocket import WebSocketApp
 from collections import deque
 
 # -----------------------------
-# 1. PAGE CONFIG
+# 1. CONFIG
 # -----------------------------
 st.set_page_config(page_title="WebSocket Analytics Engine", layout="wide")
 
 # -----------------------------
-# 2. SESSION STATE INIT
+# 2. SESSION STATE
 # -----------------------------
-if "connected" not in st.session_state:
-    st.session_state.connected = False
+if "status" not in st.session_state:
+    st.session_state.status = "DISCONNECTED"  # DISCONNECTED / CONNECTING / LIVE / ERROR
 
 if "data_stream" not in st.session_state:
     st.session_state.data_stream = deque(maxlen=500)
@@ -24,83 +24,78 @@ if "data_stream" not in st.session_state:
 if "ws_url" not in st.session_state:
     st.session_state.ws_url = ""
 
+if "last_error" not in st.session_state:
+    st.session_state.last_error = ""
+
 # -----------------------------
-# 3. SAFE PARSER (works with any JSON)
+# 3. SAFE PARSER (BINANCE + GENERIC)
 # -----------------------------
 def safe_parse(message):
     try:
         data = json.loads(message)
     except:
-        return {
-            "symbol": "raw",
-            "value": 0,
-            "quantity": 0,
-            "category": "unparsed",
-            "raw": str(message),
-            "time": time.time()
-        }
+        return None
 
     if isinstance(data, dict):
-        inner = data.get("data", data)
 
-        symbol = str(inner.get("s", inner.get("symbol", "unknown"))).lower()
+        if "data" in data:
+            data = data["data"]
 
-        price = inner.get("p", inner.get("price", 0))
-        qty = inner.get("q", inner.get("quantity", 0))
+        symbol = data.get("s") or data.get("symbol") or "unknown"
+        price = data.get("p") or data.get("price") or 0
+        qty = data.get("q") or data.get("quantity") or 0
 
         try:
             price = float(price)
-        except:
-            price = 0
-
-        try:
             qty = float(qty)
         except:
-            qty = 0
+            return None
 
         return {
-            "symbol": symbol,
-            "value": price * qty,
+            "symbol": str(symbol).lower(),
             "price": price,
             "quantity": qty,
-            "category": symbol.replace("usdt", "") if "usdt" in symbol else "generic",
-            "time": time.time()
+            "value": price * qty,
+            "category": str(symbol).lower().replace("usdt", ""),
+            "time": time.strftime("%H:%M:%S")
         }
 
-    return {
-        "symbol": "unknown",
-        "value": 0,
-        "quantity": 0,
-        "category": "unknown",
-        "time": time.time()
-    }
+    return None
 
 # -----------------------------
 # 4. WEBSOCKET WORKER
 # -----------------------------
 def run_ws(url):
 
+    def on_open(ws):
+        st.session_state.status = "LIVE"
+        print("✅ CONNECTED")
+
     def on_message(ws, message):
         parsed = safe_parse(message)
+
+        if parsed is None:
+            print("⚠️ DROPPED:", message)
+            return
+
         st.session_state.data_stream.append(parsed)
+        print("RECEIVED:", parsed)
 
     def on_error(ws, error):
-        st.session_state.connected = False
-        print("WS ERROR:", error)
+        st.session_state.status = "ERROR"
+        st.session_state.last_error = str(error)
+        print("ERROR:", error)
 
     def on_close(ws, a, b):
-        st.session_state.connected = False
-        print("WS CLOSED")
-
-    def on_open(ws):
-        print("WS CONNECTED")
+        st.session_state.status = "DISCONNECTED"
+        print("CLOSED")
 
     ws = WebSocketApp(
         url,
+        on_open=on_open,
         on_message=on_message,
         on_error=on_error,
-        on_close=on_close,
-        on_open=on_open
+        on_close=on_close
     )
 
     ws.run_forever()
@@ -115,13 +110,13 @@ def start_connection():
         st.warning("Enter WebSocket URL")
         return
 
-    if st.session_state.connected:
+    if st.session_state.status == "LIVE":
         return
+
+    st.session_state.status = "CONNECTING"
 
     t = threading.Thread(target=run_ws, args=(url,), daemon=True)
     t.start()
-
-    st.session_state.connected = True
 
 # -----------------------------
 # 6. UI
@@ -138,45 +133,55 @@ with col1:
     )
 
 with col2:
-    if not st.session_state.connected:
-        if st.button("🚀 Connect"):
-            start_connection()
-    else:
-        st.success("🟢 Connected")
+    if st.button("🚀 Connect"):
+        start_connection()
 
 # -----------------------------
-# 7. DATAFRAME
+# 7. STATUS PANEL (IMPORTANT)
+# -----------------------------
+st.markdown("### 🧠 Connection Status")
+
+if st.session_state.status == "LIVE":
+    st.success("🟢 LIVE - Receiving data")
+elif st.session_state.status == "CONNECTING":
+    st.info("🟡 CONNECTING...")
+elif st.session_state.status == "ERROR":
+    st.error(f"🔴 ERROR: {st.session_state.last_error}")
+else:
+    st.warning("⚪ DISCONNECTED")
+
+# -----------------------------
+# 8. DATAFRAME
 # -----------------------------
 df = pd.DataFrame(list(st.session_state.data_stream))
 
 # -----------------------------
-# 8. DASHBOARD
+# 9. DASHBOARD
 # -----------------------------
 if not df.empty:
 
-    st.subheader("📊 Live Stream Analytics")
+    st.subheader("📊 Live Analytics")
 
     c1, c2 = st.columns(2)
 
     with c1:
-        if "category" in df.columns:
-            fig = px.pie(df, names="category", values="value", hole=0.5)
-            st.plotly_chart(fig, use_container_width=True)
+        fig = px.pie(df, names="category", values="value", hole=0.5)
+        st.plotly_chart(fig, use_container_width=True)
 
     with c2:
         top = df.groupby("symbol")["value"].sum().reset_index()
         fig2 = px.bar(top, x="symbol", y="value")
         st.plotly_chart(fig2, use_container_width=True)
 
-    st.subheader("📦 Live Data Feed")
+    st.subheader("📦 Live Feed")
     st.dataframe(df.tail(50), use_container_width=True)
 
 else:
-    st.info("Waiting for WebSocket data...")
+    st.info("Waiting for incoming WebSocket data...")
 
 # -----------------------------
-# 9. AUTO REFRESH (CRITICAL)
+# 10. AUTO REFRESH (LIVE MODE ONLY)
 # -----------------------------
-if st.session_state.connected:
+if st.session_state.status in ["LIVE", "CONNECTING"]:
     time.sleep(2)
     st.rerun()
