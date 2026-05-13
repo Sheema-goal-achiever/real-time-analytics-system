@@ -4,169 +4,168 @@ import plotly.express as px
 import time
 import json
 import threading
-from sqlalchemy import text, create_engine
 from websocket import WebSocketApp
+from collections import deque
 
 # --- 1. PAGE CONFIG ---
 st.set_page_config(page_title="Crypto Analytics 2026", layout="wide", page_icon="📈")
 
-# --- 2. AUTO-DATABASE FIX ---
-def fix_database_schema():
-    conn = st.connection('my_database', type='sql')
-    try:
-        with conn.session as s:
-            s.execute(text("ALTER TABLE CLIENT_CONFIG ADD COLUMN IF NOT EXISTS WS_URL TEXT"))
-            s.commit()
-    except Exception:
-        pass
-
-fix_database_schema()
-
-# --- 3. SESSION STATE ---
+# --- 2. SESSION STATE ---
 if 'auth' not in st.session_state:
     st.session_state.update({
-        'auth': False, 'company': "", 'map': {}, 'ws_url': "", 'worker_started': False
+        'auth': False,
+        'company': "",
+        'map': {},
+        'ws_url': "wss://stream.binance.com:9443",
+        'worker_started': False
     })
 
-# --- 4. THE BACKGROUND WORKER ---
+# --- 3. IN-MEMORY DATA STORE ---
+if "data_store" not in st.session_state:
+    st.session_state.data_store = deque(maxlen=1000)
+
+if "users" not in st.session_state:
+    st.session_state.users = {}  # fake database
+
+# --- 4. BACKGROUND STREAM WORKER ---
 def run_custom_stream(ws_url, inventory_map):
-    try:
-        db_url = st.secrets["connections"]["my_database"]["url"]
-        engine = create_engine(db_url, pool_pre_ping=True)
-        
-        symbols = [s.strip().lower() for s in inventory_map.keys()]
-        streams = "/".join([f"{s}@trade" for s in symbols])
-        
-        if "binance.com" in ws_url and "streams=" not in ws_url:
-            socket_url = f"{ws_url.rstrip('/')}/stream?streams={streams}"
-        else:
-            socket_url = ws_url
+    symbols = [s.strip().lower() for s in inventory_map.keys()]
+    streams = "/".join([f"{s}@trade" for s in symbols])
 
-        def on_message(ws, message):
-            msg_json = json.loads(message)
-            data = msg_json.get('data', msg_json)
-            
-            raw_symbol = data.get('s', '').lower()
-            price = float(data.get('p', 0))      
-            quantity = float(data.get('q', 0))   
-            revenue = price * quantity           
-            category = inventory_map.get(raw_symbol, "Uncategorized")
-            
-            with engine.begin() as conn:
-                # Optimized INSERT for all columns
-                conn.execute(text("""
-                    INSERT INTO REALTIME_PURCHASES (PRODUCT_ID, PRICE, QUANTITY, REVENUE, REGION, EVENT_TIME) 
-                    VALUES (:s, :pr, :q, :rev, :r, NOW())
-                """), {
-                    "s": raw_symbol, "pr": price, "q": quantity, "rev": revenue, "r": category
-                })
+    if "binance.com" in ws_url and "streams=" not in ws_url:
+        socket_url = f"{ws_url.rstrip('/')}/stream?streams={streams}"
+    else:
+        socket_url = ws_url
 
-        ws = WebSocketApp(socket_url, on_message=on_message)
-        ws.run_forever()
-    except Exception:
-        pass
+    def on_message(ws, message):
+        msg_json = json.loads(message)
+        data = msg_json.get('data', msg_json)
+
+        raw_symbol = data.get('s', '').lower()
+        price = float(data.get('p', 0))
+        quantity = float(data.get('q', 0))
+        revenue = price * quantity
+        category = inventory_map.get(raw_symbol, "Uncategorized")
+
+        st.session_state.data_store.append({
+            "symbol": raw_symbol,
+            "price": price,
+            "quantity": quantity,
+            "revenue": revenue,
+            "region": category
+        })
+
+    ws = WebSocketApp(socket_url, on_message=on_message)
+    ws.run_forever()
+
 
 def start_worker():
-    for t in threading.enumerate():
-        if t.name == "CompanyWorker": return 
     if st.session_state.ws_url and st.session_state.map:
-        t = threading.Thread(target=run_custom_stream, 
-                             args=(st.session_state.ws_url, st.session_state.map), 
-                             name="CompanyWorker", daemon=True)
-        t.start()
-        st.session_state.worker_started = True
+        if not st.session_state.worker_started:
+            t = threading.Thread(
+                target=run_custom_stream,
+                args=(st.session_state.ws_url, st.session_state.map),
+                daemon=True
+            )
+            t.start()
+            st.session_state.worker_started = True
 
-# --- 5. AUTH & SIGNUP ---
+
+# --- 5. AUTH SYSTEM (IN-MEMORY) ---
 if not st.session_state.auth:
-    st.title("🔐 Terminal Gateway")
+    st.title("🔐 Terminal Gateway (Local Mode)")
+
     tab1, tab2 = st.tabs(["Login", "🚀 Register New Company"])
-    
+
     with tab1:
         with st.form("login_form"):
-            u_in, p_in = st.text_input("Company Name"), st.text_input("Password", type="password")
-            if st.form_submit_button("Enter Terminal", width='stretch'):
-                res = st.connection('my_database', type='sql').query(
-                    "SELECT * FROM CLIENT_CONFIG WHERE COMPANY_NAME=:u AND PASSWORD=:p", 
-                    params={"u":u_in, "p":p_in}, ttl=0
-                )
-                if not res.empty:
+            u_in = st.text_input("Company Name")
+            p_in = st.text_input("Password", type="password")
+
+            if st.form_submit_button("Enter Terminal"):
+                if u_in in st.session_state.users and st.session_state.users[u_in]["password"] == p_in:
                     st.session_state.auth = True
-                    st.session_state.company = res.iloc[0]['COMPANY_NAME']
-                    st.session_state.ws_url = res.iloc[0]['WS_URL'] or "wss://stream.binance.com:9443"
-                    st.session_state.map = json.loads(res.iloc[0]['CATEGORY_MAP'])
+                    st.session_state.company = u_in
+                    st.session_state.ws_url = st.session_state.users[u_in]["ws_url"]
+                    st.session_state.map = st.session_state.users[u_in]["map"]
                     st.rerun()
-                else: st.error("Invalid Credentials")
+                else:
+                    st.error("Invalid Credentials")
 
     with tab2:
         with st.form("signup_form"):
-            new_n, new_p = st.text_input("Company Name"), st.text_input("Password", type="password")
+            new_n = st.text_input("Company Name")
+            new_p = st.text_input("Password", type="password")
             ws_end = st.text_input("WebSocket URL", value="wss://stream.binance.com:9443")
             c_name = st.text_input("Category (e.g., Majors)")
             p_names = st.text_input("Symbols (e.g., btcusdt, ethusdt)")
-            
-            if st.form_submit_button("Create Account", width='stretch'):
-                f_map = {s.strip().lower(): c_name.strip() for s in p_names.split(',')} if p_names else {}
-                with st.connection('my_database', type='sql').session as s:
-                    s.execute(text("INSERT INTO CLIENT_CONFIG (COMPANY_NAME, PASSWORD, CATEGORY_MAP, WS_URL) VALUES (:n, :p, :m, :w)"),
-                              {"n": new_n, "p": new_p, "m": json.dumps(f_map), "w": ws_end})
-                    s.commit()
+
+            if st.form_submit_button("Create Account"):
+                f_map = {s.strip().lower(): c_name.strip() for s in p_names.split(',') if s.strip()}
+                st.session_state.users[new_n] = {
+                    "password": new_p,
+                    "ws_url": ws_end,
+                    "map": f_map
+                }
                 st.success("Registration Successful!")
+
 
 # --- 6. MAIN DASHBOARD ---
 else:
     start_worker()
+
     with st.sidebar:
         st.header(f"🏢 {st.session_state.company}")
-        
+
         with st.expander("➕ Add Inventory"):
             add_cat = st.text_input("Category Name")
             add_prods = st.text_area("Product Symbols")
-            if st.button("Save", width='stretch'):
+
+            if st.button("Save"):
                 for s_item in add_prods.split(','):
                     st.session_state.map[s_item.strip().lower()] = add_cat.strip()
-                with st.connection('my_database', type='sql').session as s:
-                    s.execute(text("UPDATE CLIENT_CONFIG SET CATEGORY_MAP=:m WHERE COMPANY_NAME=:c"),
-                              {"m": json.dumps(st.session_state.map), "c": st.session_state.company})
-                    s.commit()
                 st.rerun()
 
         st.divider()
-        if st.button("🧨 Truncate Table", width='stretch'):
-            with st.connection('my_database', type='sql').session as s:
-                s.execute(text("TRUNCATE TABLE REALTIME_PURCHASES"))
-                s.commit()
+
+        if st.button("🧨 Clear Data"):
+            st.session_state.data_store.clear()
             st.rerun()
 
-        if st.button("🔓 Logout", width='stretch'):
+        if st.button("🔓 Logout"):
             st.session_state.auth = False
             st.rerun()
 
-    # --- ANALYTICS WITH NULL FILTERING ---
+
+    # --- ANALYTICS ---
     st.title("📊 Real-Time Market Analytics")
-    
-    # --- THIS QUERY FILTERS OUT NULLS ---
-    df = st.connection('my_database', type='sql').query("""
-        SELECT * FROM REALTIME_PURCHASES 
-        WHERE PRICE IS NOT NULL 
-        AND QUANTITY IS NOT NULL 
-        ORDER BY EVENT_TIME DESC 
-        LIMIT 200
-    """, ttl=0)
+
+    df = pd.DataFrame(list(st.session_state.data_store))
 
     if not df.empty:
         c1, c2 = st.columns(2)
+
         with c1:
             st.subheader("Market Segment Volume")
-            st.plotly_chart(px.pie(df, names='REGION', values='REVENUE', hole=0.5, template="plotly_dark"), width='stretch')
+            st.plotly_chart(
+                px.pie(df, names='region', values='revenue', hole=0.5, template="plotly_dark"),
+                use_container_width=True
+            )
+
         with c2:
             st.subheader("Asset Drill-Down")
-            sel_cat = st.selectbox("Select Category", options=df['REGION'].unique())
-            sub_df = df[df['REGION'] == sel_cat]
-            st.plotly_chart(px.pie(sub_df, names='PRODUCT_ID', values='REVENUE', hole=0.3, template="plotly_dark"), width='stretch')
-        
-        st.dataframe(df, width='stretch', hide_index=True)
-    else:
-        st.info("No valid trade data found. Waiting for incoming stream...")
+            sel_cat = st.selectbox("Select Category", options=df['region'].unique())
+            sub_df = df[df['region'] == sel_cat]
 
-    time.sleep(4)
+            st.plotly_chart(
+                px.pie(sub_df, names='symbol', values='revenue', hole=0.3, template="plotly_dark"),
+                use_container_width=True
+            )
+
+        st.dataframe(df, use_container_width=True)
+
+    else:
+        st.info("Waiting for incoming stream...")
+
+    time.sleep(2)
     st.rerun()
