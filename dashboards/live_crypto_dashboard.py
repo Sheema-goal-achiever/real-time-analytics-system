@@ -1,187 +1,172 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import threading
-import json
 import time
+import json
+import threading
+from sqlalchemy import text, create_engine
 from websocket import WebSocketApp
-from collections import deque
 
-# -----------------------------
-# 1. CONFIG
-# -----------------------------
-st.set_page_config(page_title="WebSocket Analytics Engine", layout="wide")
+# --- 1. PAGE CONFIG ---
+st.set_page_config(page_title="Crypto Analytics 2026", layout="wide", page_icon="📈")
 
-# -----------------------------
-# 2. SESSION STATE
-# -----------------------------
-if "status" not in st.session_state:
-    st.session_state.status = "DISCONNECTED"  # DISCONNECTED / CONNECTING / LIVE / ERROR
-
-if "data_stream" not in st.session_state:
-    st.session_state.data_stream = deque(maxlen=500)
-
-if "ws_url" not in st.session_state:
-    st.session_state.ws_url = ""
-
-if "last_error" not in st.session_state:
-    st.session_state.last_error = ""
-
-# -----------------------------
-# 3. SAFE PARSER (BINANCE + GENERIC)
-# -----------------------------
-def safe_parse(message):
+# --- 2. AUTO-DATABASE FIX ---
+def fix_database_schema():
+    conn = st.connection('my_database', type='sql')
     try:
-        data = json.loads(message)
-    except:
-        return None
+        with conn.session as s:
+            s.execute(text("ALTER TABLE CLIENT_CONFIG ADD COLUMN IF NOT EXISTS WS_URL TEXT"))
+            s.commit()
+    except Exception:
+        pass
 
-    if isinstance(data, dict):
+fix_database_schema()
 
-        if "data" in data:
-            data = data["data"]
+# --- 3. SESSION STATE ---
+if 'auth' not in st.session_state:
+    st.session_state.update({
+        'auth': False, 'company': "", 'map': {}, 'ws_url': "", 'worker_started': False
+    })
 
-        symbol = data.get("s") or data.get("symbol") or "unknown"
-        price = data.get("p") or data.get("price") or 0
-        qty = data.get("q") or data.get("quantity") or 0
+# --- 4. THE BACKGROUND WORKER ---
+def run_custom_stream(ws_url, inventory_map):
+    try:
+        db_url = st.secrets["connections"]["my_database"]["url"]
+        engine = create_engine(db_url, pool_pre_ping=True)
+        
+        symbols = [s.strip().lower() for s in inventory_map.keys()]
+        streams = "/".join([f"{s}@trade" for s in symbols])
+        
+        if "binance.com" in ws_url and "streams=" not in ws_url:
+            socket_url = f"{ws_url.rstrip('/')}/stream?streams={streams}"
+        else:
+            socket_url = ws_url
 
-        try:
-            price = float(price)
-            qty = float(qty)
-        except:
-            return None
+        def on_message(ws, message):
+            msg_json = json.loads(message)
+            data = msg_json.get('data', msg_json)
+            
+            raw_symbol = data.get('s', '').lower()
+            price = float(data.get('p', 0))      
+            quantity = float(data.get('q', 0))   
+            revenue = price * quantity           
+            category = inventory_map.get(raw_symbol, "Uncategorized")
+            
+            with engine.begin() as conn:
+                # Optimized INSERT for all columns
+                conn.execute(text("""
+                    INSERT INTO REALTIME_PURCHASES (PRODUCT_ID, PRICE, QUANTITY, REVENUE, REGION, EVENT_TIME) 
+                    VALUES (:s, :pr, :q, :rev, :r, NOW())
+                """), {
+                    "s": raw_symbol, "pr": price, "q": quantity, "rev": revenue, "r": category
+                })
 
-        return {
-            "symbol": str(symbol).lower(),
-            "price": price,
-            "quantity": qty,
-            "value": price * qty,
-            "category": str(symbol).lower().replace("usdt", ""),
-            "time": time.strftime("%H:%M:%S")
-        }
+        ws = WebSocketApp(socket_url, on_message=on_message)
+        ws.run_forever()
+    except Exception:
+        pass
 
-    return None
+def start_worker():
+    for t in threading.enumerate():
+        if t.name == "CompanyWorker": return 
+    if st.session_state.ws_url and st.session_state.map:
+        t = threading.Thread(target=run_custom_stream, 
+                             args=(st.session_state.ws_url, st.session_state.map), 
+                             name="CompanyWorker", daemon=True)
+        t.start()
+        st.session_state.worker_started = True
 
-# -----------------------------
-# 4. WEBSOCKET WORKER
-# -----------------------------
-def run_ws(url):
+# --- 5. AUTH & SIGNUP ---
+if not st.session_state.auth:
+    st.title("🔐 Terminal Gateway")
+    tab1, tab2 = st.tabs(["Login", "🚀 Register New Company"])
+    
+    with tab1:
+        with st.form("login_form"):
+            u_in, p_in = st.text_input("Company Name"), st.text_input("Password", type="password")
+            if st.form_submit_button("Enter Terminal", width='stretch'):
+                res = st.connection('my_database', type='sql').query(
+                    "SELECT * FROM CLIENT_CONFIG WHERE COMPANY_NAME=:u AND PASSWORD=:p", 
+                    params={"u":u_in, "p":p_in}, ttl=0
+                )
+                if not res.empty:
+                    st.session_state.auth = True
+                    st.session_state.company = res.iloc[0]['COMPANY_NAME']
+                    st.session_state.ws_url = res.iloc[0]['WS_URL'] or "wss://stream.binance.com:9443"
+                    st.session_state.map = json.loads(res.iloc[0]['CATEGORY_MAP'])
+                    st.rerun()
+                else: st.error("Invalid Credentials")
 
-    def on_open(ws):
-        st.session_state.status = "LIVE"
-        print("✅ CONNECTED")
+    with tab2:
+        with st.form("signup_form"):
+            new_n, new_p = st.text_input("Company Name"), st.text_input("Password", type="password")
+            ws_end = st.text_input("WebSocket URL", value="wss://stream.binance.com:9443")
+            c_name = st.text_input("Category (e.g., Majors)")
+            p_names = st.text_input("Symbols (e.g., btcusdt, ethusdt)")
+            
+            if st.form_submit_button("Create Account", width='stretch'):
+                f_map = {s.strip().lower(): c_name.strip() for s in p_names.split(',')} if p_names else {}
+                with st.connection('my_database', type='sql').session as s:
+                    s.execute(text("INSERT INTO CLIENT_CONFIG (COMPANY_NAME, PASSWORD, CATEGORY_MAP, WS_URL) VALUES (:n, :p, :m, :w)"),
+                              {"n": new_n, "p": new_p, "m": json.dumps(f_map), "w": ws_end})
+                    s.commit()
+                st.success("Registration Successful!")
 
-    def on_message(ws, message):
-        parsed = safe_parse(message)
-
-        if parsed is None:
-            print("⚠️ DROPPED:", message)
-            return
-
-        st.session_state.data_stream.append(parsed)
-        print("RECEIVED:", parsed)
-
-    def on_error(ws, error):
-        st.session_state.status = "ERROR"
-        st.session_state.last_error = str(error)
-        print("ERROR:", error)
-
-    def on_close(ws, a, b):
-        st.session_state.status = "DISCONNECTED"
-        print("CLOSED")
-
-    ws = WebSocketApp(
-        url,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-
-    ws.run_forever()
-
-# -----------------------------
-# 5. START CONNECTION
-# -----------------------------
-def start_connection():
-    url = st.session_state.ws_url.strip()
-
-    if not url:
-        st.warning("Enter WebSocket URL")
-        return
-
-    if st.session_state.status == "LIVE":
-        return
-
-    st.session_state.status = "CONNECTING"
-
-    t = threading.Thread(target=run_ws, args=(url,), daemon=True)
-    t.start()
-
-# -----------------------------
-# 6. UI
-# -----------------------------
-st.title("📡 Universal Real-Time WebSocket Analytics Engine")
-
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    st.session_state.ws_url = st.text_input(
-        "WebSocket URL",
-        value=st.session_state.ws_url or
-        "wss://stream.binance.com:9443/stream?streams=btcusdt@trade"
-    )
-
-with col2:
-    if st.button("🚀 Connect"):
-        start_connection()
-
-# -----------------------------
-# 7. STATUS PANEL (IMPORTANT)
-# -----------------------------
-st.markdown("### 🧠 Connection Status")
-
-if st.session_state.status == "LIVE":
-    st.success("🟢 LIVE - Receiving data")
-elif st.session_state.status == "CONNECTING":
-    st.info("🟡 CONNECTING...")
-elif st.session_state.status == "ERROR":
-    st.error(f"🔴 ERROR: {st.session_state.last_error}")
+# --- 6. MAIN DASHBOARD ---
 else:
-    st.warning("⚪ DISCONNECTED")
+    start_worker()
+    with st.sidebar:
+        st.header(f"🏢 {st.session_state.company}")
+        
+        with st.expander("➕ Add Inventory"):
+            add_cat = st.text_input("Category Name")
+            add_prods = st.text_area("Product Symbols")
+            if st.button("Save", width='stretch'):
+                for s_item in add_prods.split(','):
+                    st.session_state.map[s_item.strip().lower()] = add_cat.strip()
+                with st.connection('my_database', type='sql').session as s:
+                    s.execute(text("UPDATE CLIENT_CONFIG SET CATEGORY_MAP=:m WHERE COMPANY_NAME=:c"),
+                              {"m": json.dumps(st.session_state.map), "c": st.session_state.company})
+                    s.commit()
+                st.rerun()
 
-# -----------------------------
-# 8. DATAFRAME
-# -----------------------------
-df = pd.DataFrame(list(st.session_state.data_stream))
+        st.divider()
+        if st.button("🧨 Truncate Table", width='stretch'):
+            with st.connection('my_database', type='sql').session as s:
+                s.execute(text("TRUNCATE TABLE REALTIME_PURCHASES"))
+                s.commit()
+            st.rerun()
 
-# -----------------------------
-# 9. DASHBOARD
-# -----------------------------
-if not df.empty:
+        if st.button("🔓 Logout", width='stretch'):
+            st.session_state.auth = False
+            st.rerun()
 
-    st.subheader("📊 Live Analytics")
+    # --- ANALYTICS WITH NULL FILTERING ---
+    st.title("📊 Real-Time Market Analytics")
+    
+    # --- THIS QUERY FILTERS OUT NULLS ---
+    df = st.connection('my_database', type='sql').query("""
+        SELECT * FROM REALTIME_PURCHASES 
+        WHERE PRICE IS NOT NULL 
+        AND QUANTITY IS NOT NULL 
+        ORDER BY EVENT_TIME DESC 
+        LIMIT 200
+    """, ttl=0)
 
-    c1, c2 = st.columns(2)
+    if not df.empty:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Market Segment Volume")
+            st.plotly_chart(px.pie(df, names='REGION', values='REVENUE', hole=0.5, template="plotly_dark"), width='stretch')
+        with c2:
+            st.subheader("Asset Drill-Down")
+            sel_cat = st.selectbox("Select Category", options=df['REGION'].unique())
+            sub_df = df[df['REGION'] == sel_cat]
+            st.plotly_chart(px.pie(sub_df, names='PRODUCT_ID', values='REVENUE', hole=0.3, template="plotly_dark"), width='stretch')
+        
+        st.dataframe(df, width='stretch', hide_index=True)
+    else:
+        st.info("No valid trade data found. Waiting for incoming stream...")
 
-    with c1:
-        fig = px.pie(df, names="category", values="value", hole=0.5)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with c2:
-        top = df.groupby("symbol")["value"].sum().reset_index()
-        fig2 = px.bar(top, x="symbol", y="value")
-        st.plotly_chart(fig2, use_container_width=True)
-
-    st.subheader("📦 Live Feed")
-    st.dataframe(df.tail(50), use_container_width=True)
-
-else:
-    st.info("Waiting for incoming WebSocket data...")
-
-# -----------------------------
-# 10. AUTO REFRESH (LIVE MODE ONLY)
-# -----------------------------
-if st.session_state.status in ["LIVE", "CONNECTING"]:
-    time.sleep(2)
+    time.sleep(4)
     st.rerun()
