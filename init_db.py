@@ -2,10 +2,10 @@ import mysql.connector
 
 # 1. PASTE YOUR AIVEN DETAILS HERE
 db_config = {
-    "host": "mysql-f0d7079-realtime-data-analytics.j.aivencloud.com",
+    "host": "mysq******.aivencloud.com",
     "port": "16060",
     "user": "avnadmin",
-    "password": "AVNS_cKq5YoRFgPSrC4t9CGn",
+    "password": "****",
     "database": "defaultdb"
 }
 
